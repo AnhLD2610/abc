@@ -1,0 +1,67 @@
+# Example configuration for efficient reasoning with contrastive learning
+# Usage: python -m open_r1.grpo --config example_config.yaml
+
+# Model configuration
+model_name_or_path: "microsoft/DialoGPT-medium"  # Replace with your model
+torch_dtype: "bfloat16"
+attn_implementation: "flash_attention_2"
+
+# Dataset configuration  
+dataset_name: "your_math_dataset"  # Replace with your dataset
+dataset_train_split: "train"
+dataset_test_split: "test"
+dataset_prompt_column: "prompt"
+
+# Training configuration
+output_dir: "./outputs/efficient_reasoning"
+num_train_epochs: 3
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 5e-6
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.1
+logging_steps: 10
+save_steps: 500
+eval_steps: 500
+eval_strategy: "steps"
+save_strategy: "steps"
+save_total_limit: 3
+
+# GRPO specific configuration
+reward_funcs: 
+  - "length_accuracy"      # Combined length + accuracy reward
+  - "majority_voting"      # Handle cases with no ground truth
+  - "entropy_exploration"  # High entropy for difficult questions
+
+# Enhanced GRPO with Contrastive Learning
+contrastive_weight: 0.5    # Weight for supervised contrastive loss (set to 0.0 to disable)
+infonce_weight: 0.3        # Weight for InfoNCE loss (set to 0.0 to disable)
+temperature: 0.07          # Temperature for contrastive similarity computation
+difficulty_threshold: 0.3  # Success rate threshold for entropy exploration
+
+# Reward function parameters
+cosine_min_value_wrong: -1.0
+cosine_max_value_wrong: -0.5
+cosine_min_value_correct: 0.5
+cosine_max_value_correct: 1.0
+cosine_max_len: 1000
+
+# Length penalty configuration
+max_completion_len: 2048
+soft_punish_cache: 512
+
+# Logging and monitoring
+report_to: ["wandb"]
+wandb_project: "efficient_reasoning"
+wandb_entity: "your_entity"
+wandb_run_group: "contrastive_grpo"
+logging_first_step: true
+num_completions_to_print: 5
+
+# System configuration
+fp16: false
+bf16: true
+dataloader_num_workers: 4
+remove_unused_columns: false
+seed: 42

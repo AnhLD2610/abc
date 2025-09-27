@@ -23,13 +23,8 @@ from trl import GRPOTrainer
 from transformers import PreTrainedModel
 from accelerate import logging
 
-## reward 
-from rewards import accuracy_reward, len_reward, format_reward
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
-from collections import Counter
-
-
 logger = logging.get_logger(__name__)
 
 
@@ -37,9 +32,8 @@ class EnhancedGRPOTrainer(GRPOTrainer):
     """
     Enhanced GRPO Trainer implementing:
     1. Supervised Contrastive Learning with length + accuracy rewards
-    2. InfoNCE loss for shortest correct answers
-    3. Majority voting for edge cases (TTRL paper)
-    4. High entropy exploration for hard questions (REASONING WITH EXPLORATION paper)
+    2. Majority voting for edge cases (TTRL paper)
+    3. High entropy exploration for hard questions (REASONING WITH EXPLORATION paper)
     """
     
     def __init__(
@@ -47,9 +41,7 @@ class EnhancedGRPOTrainer(GRPOTrainer):
         model: Union[str, PreTrainedModel],
         reward_funcs: Union[List, Any],
         use_contrastive: bool = False,
-        use_infonce: bool = False,
         contrastive_weight: float = 0.1,
-        infonce_weight: float = 0.1,
         contrastive_temperature: float = 0.07,
         length_reward_weight: float = 0.3,
         accuracy_reward_weight: float = 0.7,
@@ -60,9 +52,7 @@ class EnhancedGRPOTrainer(GRPOTrainer):
         
         # Contrastive learning settings
         self.use_contrastive = use_contrastive
-        self.use_infonce = use_infonce
         self.contrastive_weight = contrastive_weight
-        self.infonce_weight = infonce_weight
         self.contrastive_temperature = contrastive_temperature
         
         # Reward composition settings
@@ -72,8 +62,9 @@ class EnhancedGRPOTrainer(GRPOTrainer):
         # Entropy exploration settings
         self.high_entropy_temperature = high_entropy_temperature
         
-        logger.info(f"Enhanced GRPO initialized: contrastive={use_contrastive}, "
-                   f"infonce={use_infonce}, weights=({contrastive_weight}, {infonce_weight})")
+        logger.info(
+            f"Enhanced GRPO initialized: contrastive={use_contrastive}, weight={contrastive_weight}"
+        )
 
 
     def _detect_hard_questions(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -254,13 +245,6 @@ class EnhancedGRPOTrainer(GRPOTrainer):
             pos_mask[shortest_idx] = True
             neg_mask = ~pos_mask
         
-        # Edge case 2: No negatives - convert longest correct to negative
-        elif not neg_mask.any() and pos_mask.sum() > 1:
-            pos_lengths = lengths * pos_mask.float() + (1 - pos_mask.float()) * (-1)
-            longest_pos_idx = pos_lengths.argmax()
-            pos_mask[longest_pos_idx] = False
-            neg_mask[longest_pos_idx] = True
-        
         return pos_mask, neg_mask
 
     def _get_contrastive_embeddings(
@@ -290,14 +274,13 @@ class EnhancedGRPOTrainer(GRPOTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         
         # Forward pass to get hidden states
-        with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False
-            )
-            hidden_states = outputs.hidden_states[-1]  # Last layer: [batch_size, seq_len, hidden_dim]
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False
+        )
+        hidden_states = outputs.hidden_states[-1]  # Last layer: [batch_size, seq_len, hidden_dim]
         
         # Extract embeddings
         prompt_len = prompt_ids.size(1)
@@ -324,85 +307,31 @@ class EnhancedGRPOTrainer(GRPOTrainer):
 
     def _compute_supervised_contrastive_loss(
         self,
-        anchors: torch.Tensor,
-        positives: torch.Tensor, 
-        negatives: torch.Tensor
+        anchor: torch.Tensor,
+        completion_embeds: torch.Tensor,
+        pos_mask: torch.Tensor,
+        weights: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute supervised contrastive loss: multiple positives vs multiple negatives.
-        
-        Args:
-            anchors: [num_prompts, hidden_dim]
-            positives: [num_prompts, num_pos, hidden_dim] 
-            negatives: [num_prompts, num_neg, hidden_dim]
-            
-        Returns:
-            Contrastive loss scalar
-        """
-        num_prompts = anchors.size(0)
-        total_loss = 0.0
-        num_valid = 0
-        
-        for i in range(num_prompts):
-            anchor = F.normalize(anchors[i], dim=-1)  # [hidden_dim]
-            pos = F.normalize(positives[i], dim=-1)   # [num_pos, hidden_dim]
-            neg = F.normalize(negatives[i], dim=-1)   # [num_neg, hidden_dim]
-            
-            if pos.size(0) > 0 and neg.size(0) > 0:
-                # Compute similarities
-                pos_sims = torch.matmul(anchor, pos.T) / self.contrastive_temperature  # [num_pos]
-                neg_sims = torch.matmul(anchor, neg.T) / self.contrastive_temperature  # [num_neg]
-                
-                # Supervised contrastive loss
-                pos_exp_sum = torch.logsumexp(pos_sims, dim=0)
-                all_sims = torch.cat([pos_sims, neg_sims])
-                all_exp_sum = torch.logsumexp(all_sims, dim=0)
-                
-                loss = -pos_exp_sum + all_exp_sum
-                total_loss += loss
-                num_valid += 1
-        
-        return total_loss / max(num_valid, 1)
+        """Compute weighted supervised contrastive loss for one prompt group."""
 
-    def _compute_infonce_loss(
-        self,
-        anchors: torch.Tensor,
-        positives: torch.Tensor,
-        negatives: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute InfoNCE loss: single shortest correct answer vs all others.
-        
-        Args:
-            anchors: [num_prompts, hidden_dim]
-            positives: [num_prompts, hidden_dim] - single shortest correct answer
-            negatives: [num_prompts, num_neg, hidden_dim] - all other answers
-            
-        Returns:
-            InfoNCE loss scalar
-        """
-        num_prompts = anchors.size(0)
-        total_loss = 0.0
-        num_valid = 0
-        
-        for i in range(num_prompts):
-            anchor = F.normalize(anchors[i], dim=-1)     # [hidden_dim]
-            positive = F.normalize(positives[i], dim=-1) # [hidden_dim]
-            neg = F.normalize(negatives[i], dim=-1)      # [num_neg, hidden_dim]
-            
-            if neg.size(0) > 0:
-                # Compute similarities
-                pos_sim = torch.dot(anchor, positive) / self.contrastive_temperature
-                neg_sims = torch.matmul(anchor, neg.T) / self.contrastive_temperature  # [num_neg]
-                
-                # InfoNCE loss
-                all_sims = torch.cat([pos_sim.unsqueeze(0), neg_sims])
-                loss = -pos_sim + torch.logsumexp(all_sims, dim=0)
-                
-                total_loss += loss
-                num_valid += 1
-        
-        return total_loss / max(num_valid, 1)
+        pos_count = pos_mask.sum().item()
+        if pos_count == 0 or pos_count == completion_embeds.size(0):
+            return torch.tensor(0.0, device=anchor.device)
+
+        anchor_norm = F.normalize(anchor, dim=-1)
+        completions_norm = F.normalize(completion_embeds, dim=-1)
+
+        sims = torch.matmul(completions_norm, anchor_norm) / self.contrastive_temperature
+
+        eps = 1e-12
+        logits = sims + torch.log(weights + eps)
+        denom = torch.logsumexp(logits, dim=0)
+
+        pos_logits = logits[pos_mask]
+        pos_weights = weights[pos_mask]
+        pos_weights = pos_weights / pos_weights.sum()
+
+        return (pos_weights * (denom - pos_logits)).sum()
 
     def _generate_and_score_completions(self, model, inputs):
         """
@@ -488,9 +417,8 @@ class EnhancedGRPOTrainer(GRPOTrainer):
         base_loss = super()._compute_loss(model, inputs)
         
         # Return early if contrastive learning disabled
-        if not (self.use_contrastive or self.use_infonce):
+        if not self.use_contrastive:
             return base_loss
-            
         try:
             # Extract data from inputs
             prompt_ids = inputs["prompt_ids"]
@@ -526,99 +454,44 @@ class EnhancedGRPOTrainer(GRPOTrainer):
             
             # Initialize losses
             contrastive_loss = torch.tensor(0.0, device=base_loss.device)
-            infonce_loss = torch.tensor(0.0, device=base_loss.device)
-            
-            # Compute losses for each prompt group
-            if self.use_contrastive or self.use_infonce:
-                all_anchors = []
-                all_positives_cont = []  # For supervised contrastive (multiple positives)
-                all_negatives_cont = []
-                all_positives_info = []  # For InfoNCE (single shortest positive)
-                all_negatives_info = []
-                
-                for prompt_idx in range(num_prompts):
-                    group_rewards = rewards_grouped[prompt_idx]
-                    group_lengths = lengths_grouped[prompt_idx]
-                    group_completions_embeds = completion_embeds_grouped[prompt_idx]
-                    
-                    # Get positive/negative masks
-                    pos_mask, neg_mask = self._get_pos_neg_masks(group_rewards, group_lengths)
-                    
-                    if pos_mask.any() and neg_mask.any():
-                        anchor = prompt_embeds_grouped[prompt_idx]
-                        
-                        # For supervised contrastive: all positives
-                        positives = group_completions_embeds[pos_mask]
-                        negatives = group_completions_embeds[neg_mask]
-                        
-                        all_anchors.append(anchor)
-                        all_positives_cont.append(positives)
-                        all_negatives_cont.append(negatives)
-                        
-                        # For InfoNCE: shortest positive only
-                        pos_indices = pos_mask.nonzero(as_tuple=True)[0]
-                        pos_lengths = group_lengths[pos_indices]
-                        shortest_pos_idx = pos_indices[pos_lengths.argmin()]
-                        shortest_positive = group_completions_embeds[shortest_pos_idx]
-                        
-                        # All others (including other positives) as negatives for InfoNCE
-                        infonce_neg_mask = torch.ones(self.args.num_generations, dtype=torch.bool, device=group_rewards.device)
-                        infonce_neg_mask[shortest_pos_idx] = False
-                        infonce_negatives = group_completions_embeds[infonce_neg_mask]
-                        
-                        all_positives_info.append(shortest_positive)
-                        all_negatives_info.append(infonce_negatives)
-                
-                # Compute losses
-                if all_anchors and self.use_contrastive:
-                    anchors_tensor = torch.stack(all_anchors)
-                    # Pad positives and negatives to same length for batching
-                    max_pos = max(pos.size(0) for pos in all_positives_cont) if all_positives_cont else 0
-                    max_neg = max(neg.size(0) for neg in all_negatives_cont) if all_negatives_cont else 0
-                    
-                    if max_pos > 0 and max_neg > 0:
-                        # Simple approach: compute loss for each group separately
-                        total_cont_loss = 0.0
-                        num_valid = 0
-                        for i, (anchor, pos, neg) in enumerate(zip(all_anchors, all_positives_cont, all_negatives_cont)):
-                            if pos.size(0) > 0 and neg.size(0) > 0:
-                                group_loss = self._compute_supervised_contrastive_loss(
-                                    anchor.unsqueeze(0), pos.unsqueeze(0), neg.unsqueeze(0)
-                                )
-                                total_cont_loss += group_loss
-                                num_valid += 1
-                        contrastive_loss = total_cont_loss / max(num_valid, 1)
-                
-                if all_anchors and self.use_infonce:
-                    anchors_tensor = torch.stack(all_anchors)
-                    positives_tensor = torch.stack(all_positives_info)
-                    
-                    # Compute InfoNCE loss for each group
-                    total_info_loss = 0.0
-                    num_valid = 0
-                    for i, (anchor, pos, neg) in enumerate(zip(all_anchors, all_positives_info, all_negatives_info)):
-                        if neg.size(0) > 0:
-                            group_loss = self._compute_infonce_loss(
-                                anchor.unsqueeze(0), pos.unsqueeze(0), neg.unsqueeze(0)
-                            )
-                            total_info_loss += group_loss
-                            num_valid += 1
-                    infonce_loss = total_info_loss / max(num_valid, 1)
-            
-            # Combine losses
-            total_loss = (base_loss + 
-                         self.contrastive_weight * contrastive_loss + 
-                         self.infonce_weight * infonce_loss)
-            
-            # Log losses
-            if hasattr(self, 'log'):
-                self.log({
-                    "train/base_loss": base_loss.item(),
-                    "train/contrastive_loss": contrastive_loss.item(),
-                    "train/infonce_loss": infonce_loss.item(),
-                    "train/total_loss": total_loss.item(),
-                })
-            
+            num_valid = 0
+
+            for prompt_idx in range(num_prompts):
+                group_rewards = rewards_grouped[prompt_idx]
+                group_lengths = lengths_grouped[prompt_idx]
+                group_completions_embeds = completion_embeds_grouped[prompt_idx]
+
+                pos_mask, neg_mask = self._get_pos_neg_masks(group_rewards, group_lengths)
+
+                if not (pos_mask.any() and neg_mask.any()):
+                    continue
+
+                anchor = prompt_embeds_grouped[prompt_idx]
+        weights = torch.softmax(group_rewards, dim=0)
+
+                group_loss = self._compute_supervised_contrastive_loss(
+                    anchor,
+                group_completions_embeds,
+                pos_mask,
+                weights,
+                )
+
+                contrastive_loss += group_loss
+                num_valid += 1
+
+            contrastive_loss = contrastive_loss / max(num_valid, 1)
+
+            total_loss = base_loss + self.contrastive_weight * contrastive_loss
+
+            if hasattr(self, "log"):
+                self.log(
+                    {
+                        "train/base_loss": base_loss.item(),
+                        "train/contrastive_loss": contrastive_loss.item(),
+                        "train/total_loss": total_loss.item(),
+                    }
+                )
+
             return total_loss
             
         except Exception as e:

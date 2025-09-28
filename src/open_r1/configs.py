@@ -343,7 +343,7 @@ class GRPOScriptArguments(ScriptArguments):
         default=0.3,
         metadata={"help": "Weight for InfoNCE loss in total loss."},
     )
-    temperature: float = field(
+    contrastive_temperature: float = field(
         default=0.07,
         metadata={"help": "Temperature for contrastive learning similarity computation."},
     )

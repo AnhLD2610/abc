@@ -1,0 +1,94 @@
+# Contrastive GRPO config for Qwen3 0.6B with eager attention
+# Usage:
+#   python -m open_r1.grpo --config /media/data/thanhnb/abc/src/open_r1/contrastive_qwen3.yaml
+
+# Model configuration
+model_name_or_path: "Qwen/Qwen3-0.6B"
+torch_dtype: "bfloat16"
+attn_implementation: "eager"
+
+# Dataset configuration
+dataset_name: "GAIR/LIMO"
+dataset_train_split: "train"
+dataset_test_split: "validation"
+dataset_prompt_column: "question"
+
+# Output and logging
+output_dir: "./outputs/contrastive_qwen3"
+overwrite_output_dir: true
+run_name: "contrastive_qwen3"
+report_to: []  # Disable wandb logging
+logging_steps: 1
+save_steps: 500
+eval_steps: 500
+save_total_limit: 1
+evaluation_strategy: "steps"
+save_strategy: "epoch"
+push_to_hub: false
+log_completions: true
+log_level: "debug"
+logging_first_step: true
+logging_strategy: "steps"
+
+# Training hyperparameters
+num_train_epochs: 1
+max_steps: -1
+per_device_train_batch_size: 1  # Keep small due to memory constraints
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 2  # Increased to make effective batch size = 4 (divisible by num_generations=2)
+learning_rate: 2.0e-05
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.1
+seed: 42
+
+# Precision & performance
+bf16: true
+use_vllm: false  # Disable vLLM
+do_eval: false
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+fp16: false
+dataloader_num_workers: 0  # Disable multi-processing data loading
+remove_unused_columns: false
+
+# Generation parameters used during GRPO rollouts
+num_generations: 2  # Keep as requested, using gradient accumulation to handle batch size
+steps_per_generation: 2  # Generate every step
+num_iterations: 1  # Number of iterations per generation
+temperature: 0.7
+top_p: 0.9
+top_k: 50
+max_prompt_length: 256   # Increased to allow for longer context
+max_completion_length: 1024  # Increased to allow for complete answers
+beta: 0.01
+epsilon: 0.2
+
+# Contrastive learning settings
+use_contrastive: true
+contrastive_weight: 0.5
+contrastive_temperature: 0.07
+length_reward_weight: 0.3
+accuracy_reward_weight: 0.7
+high_entropy_temperature: 1.5
+
+# Reward functions
+reward_funcs:
+  - "length_accuracy"
+  - "majority_voting"
+  - "entropy_exploration"
+
+# Reward parameters
+cosine_min_value_wrong: -1.0
+cosine_max_value_wrong: -0.5
+cosine_min_value_correct: 0.5
+cosine_max_value_correct: 1.0
+cosine_max_len: 1000
+max_completion_len: 2048
+soft_punish_cache: 512
+difficulty_threshold: 0.3
+
+# WandB (optional)
+wandb_project: "efficient_reasoning"
+wandb_entity: "your_entity"
+wandb_run_group: "contrastive_qwen3"

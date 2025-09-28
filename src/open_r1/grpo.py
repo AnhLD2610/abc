@@ -26,7 +26,7 @@ from open_r1.rewards import get_reward_funcs
 from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
-from open_r1.enhanced_trainer import EnhancedGRPOTrainer
+from open_r1.contrastive_trainer import ContrastiveTrainer
 from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
@@ -110,13 +110,12 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize Enhanced GRPO trainer
     #############################
-    # Determine if we should use enhanced features
-    use_contrastive = getattr(script_args, 'contrastive_weight', 0.0) > 0.0
-    use_infonce = getattr(script_args, 'infonce_weight', 0.0) > 0.0
+    # Determine if we should use contrastive features
+    use_contrastive = getattr(script_args, 'use_contrastive', False)
     
-    if use_contrastive or use_infonce:
-        logger.info("Using Enhanced GRPO Trainer with contrastive learning features")
-        trainer = EnhancedGRPOTrainer(
+    if use_contrastive:
+        logger.info("Using Contrastive GRPO Trainer")
+        trainer = ContrastiveTrainer(
             model=model,
             reward_funcs=reward_funcs,
             args=training_args,
@@ -125,11 +124,13 @@ def main(script_args, training_args, model_args):
             peft_config=get_peft_config(model_args),
             callbacks=get_callbacks(training_args, model_args),
             processing_class=tokenizer,
-            # Enhanced features
-            contrastive_weight=getattr(script_args, 'contrastive_weight', 0.0),
-            infonce_weight=getattr(script_args, 'infonce_weight', 0.0),
-            contrastive_temperature=getattr(script_args, 'temperature', 0.07),
-            enable_length_reward_scaling=True,
+            # Contrastive features
+            use_contrastive=True,
+            contrastive_weight=getattr(script_args, 'contrastive_weight', 0.5),
+            contrastive_temperature=getattr(script_args, 'contrastive_temperature', 0.07),
+            length_reward_weight=getattr(script_args, 'length_reward_weight', 0.3),
+            accuracy_reward_weight=getattr(script_args, 'accuracy_reward_weight', 0.7),
+            high_entropy_temperature=getattr(script_args, 'high_entropy_temperature', 1.5)
         )
     else:
         logger.info("Using standard GRPO Trainer")

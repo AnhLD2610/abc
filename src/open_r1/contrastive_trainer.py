@@ -77,6 +77,7 @@ class ContrastiveTrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        print("DEBUG: Starting generation and scoring")
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -98,6 +99,9 @@ class ContrastiveTrainer(GRPOTrainer):
             sampling_per_token_logps,
             forward_kwargs,
         ) = self._generate(prompts, images)
+        
+        print("DEBUG: Generation completed")
+        print(f"Generated completion_ids shape: {completion_ids.shape}")
 
         # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
         # to re-tokenize completions if the reward is computed from tokens.
@@ -346,6 +350,7 @@ class ContrastiveTrainer(GRPOTrainer):
 
 
     def _compute_loss(self, model, inputs):
+        print("DEBUG: Entering _compute_loss")
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -462,6 +467,18 @@ class ContrastiveTrainer(GRPOTrainer):
 
         contrastive_loss = torch.tensor(0.0, device=loss.device)
         if self.use_contrastive:
+            print('DEBUG: Entering contrastive block')
+            print('start prompt_ids:')
+            print(prompt_ids.shape)
+            print(prompt_ids)
+            print('end prompt_ids:')
+
+            print('start completion ids:')
+            print(completion_ids.shape)
+            print(completion_ids)
+            print('end completion ids:')
+
+            print("DEBUG: Starting contrastive embedding computation")
             prompt_embeds, completion_embeds = self._get_prompt_completion_embeddings(
                 model,
                 prompt_ids,
@@ -519,6 +536,7 @@ class ContrastiveTrainer(GRPOTrainer):
 
                 if valid_groups > 0:
                     contrastive_loss = total / valid_groups
+                    print(f"DEBUG: Contrastive loss computed: {contrastive_loss.item()}")
                     contrastive_loss = contrastive_loss / self.current_gradient_accumulation_steps
                     self._metrics[mode]["contrastive_loss"].append(contrastive_loss.item())
 

@@ -1,2 +1,1 @@
-
 CUDA_VISIBLE_DEVICES=2 python -m open_r1.grpo --config /home/ubuntu/abc/src/open_r1/contrastive_qwen3.yaml

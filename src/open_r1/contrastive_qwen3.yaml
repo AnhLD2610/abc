@@ -33,8 +33,8 @@ logging_strategy: "steps"
 # Training hyperparameters
 num_train_epochs: 1
 max_steps: -1
-per_device_train_batch_size: 1  # Keep small due to memory constraints
-per_device_eval_batch_size: 1
+per_device_train_batch_size: 4  # Keep small due to memory constraints
+per_device_eval_batch_size: 4 
 gradient_accumulation_steps: 2  # Increased to make effective batch size = 4 (divisible by num_generations=2)
 learning_rate: 2.0e-05
 lr_scheduler_type: "cosine"
@@ -53,14 +53,14 @@ dataloader_num_workers: 0  # Disable multi-processing data loading
 remove_unused_columns: false
 
 # Generation parameters used during GRPO rollouts
-num_generations: 2  # Keep as requested, using gradient accumulation to handle batch size
+num_generations: 4  # Keep as requested, using gradient accumulation to handle batch size
 steps_per_generation: 2  # Generate every step
 num_iterations: 1  # Number of iterations per generation
 temperature: 0.7
 top_p: 0.9
 top_k: 50
 max_prompt_length: 256   # Increased to allow for longer context
-max_completion_length: 1024  # Increased to allow for complete answers
+max_completion_length: 4096  # Increased to allow for complete answers
 beta: 0.01
 epsilon: 0.2
 

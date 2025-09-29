@@ -40,7 +40,7 @@ class ContrastiveTrainer(GRPOTrainer):
         **kwargs
     ):
         super().__init__(model=model, reward_funcs=reward_funcs, **kwargs)
-                # Contrastive learning settings
+        # Contrastive learning settings
         self.use_contrastive = use_contrastive
         self.contrastive_weight = contrastive_weight
         self.contrastive_temperature = contrastive_temperature
@@ -71,238 +71,6 @@ class ContrastiveTrainer(GRPOTrainer):
         hard_mask = (rewards == 1).sum(dim=1) == 0  # [num_prompts]
         
         return hard_mask
-    
-
-    # apply major voting 
-    def _generate_and_score_completions(
-        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
-    ) -> dict[str, Union[torch.Tensor, Any]]:
-        print("DEBUG: Starting generation and scoring")
-        device = self.accelerator.device
-        mode = "train" if self.model.training else "eval"
-
-        prompts = [x["prompt"] for x in inputs]
-
-        if "images" in inputs[0]:
-            images = [example.get("images") for example in inputs]
-        elif "image" in inputs[0]:
-            images = [[example.get("image")] if example.get("image") is not None else None for example in inputs]
-        else:
-            images = None
-
-        (
-            prompt_ids,
-            completion_ids,
-            prompt_mask,
-            completion_mask,
-            num_items_in_batch,
-            sampling_per_token_logps,
-            forward_kwargs,
-        ) = self._generate(prompts, images)
-        
-        print("DEBUG: Generation completed")
-        print(f"Generated completion_ids shape: {completion_ids.shape}")
-
-        # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
-        # to re-tokenize completions if the reward is computed from tokens.
-        completion_ids_list = [row[mask_row].tolist() for row, mask_row in zip(completion_ids, completion_mask.bool())]
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        logits_prompt_len_to_keep = prompt_ids.size(dim=1)  # (B,)
-        
-
-        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
-
-        num_images = [len(img_list) for img_list in images] if images is not None else None
-
-        with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
-            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                )
-            else:
-                old_per_token_logps = None
-
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
-                importance_sampling_ratio = torch.clamp(
-                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                )
-
-            # Compute the per-token log probabilities for the reference model
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                    )
-                else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=batch_size,
-                            num_images=num_images,
-                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                        )
-            else:
-                ref_per_token_logps = None
-
-        # Decode
-        prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = []
-            for prompt, completion in zip(prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        else:
-            completions = completions_text
-
-        # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
-        # important because rewards will be normalized per group, and completions are distributed. We will later slice
-        # rewards_per_func to extract each process's subset.
-        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
-
-        # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
-
-        if self.scale_rewards in ["group", "none"]:
-            # If self.scale_rewards = "none", we'll still log group level std
-            std_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-            std_rewards = std_rewards.repeat_interleave(self.num_generations, dim=0)
-        elif self.scale_rewards == "batch":
-            # Compute global std
-            std_rewards = rewards.std().expand_as(rewards)
-        else:
-            raise ValueError(
-                f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
-            )
-
-        is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-        if self.scale_rewards != "none":
-            advantages = advantages / (std_rewards + 1e-4)
-
-        # Slice to keep only the local part of the data
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
-        advantages = advantages[process_slice]
-
-        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-        for i, reward_func_name in enumerate(self.reward_func_names):
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-
-        # Log prompt and completion texts
-        self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["completion"].extend(gather_object(completions_text))
-        for i, name in enumerate(self.reward_func_names):
-            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._logs["advantages"].extend(all_process_advantages.tolist())
-
-        if images is not None:
-            self._logs["images"].extend(gather_object(images))
-
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            delta = delta[completion_mask.bool()]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
-
-            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
-
-        output = {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "advantages": advantages,
-            "num_items_in_batch": num_items_in_batch,
-        }
-        if old_per_token_logps is not None:
-            output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            output["importance_sampling_ratio"] = importance_sampling_ratio
-        if ref_per_token_logps is not None:
-            output["ref_per_token_logps"] = ref_per_token_logps
-        if "pixel_values" in forward_kwargs:
-            output["pixel_values"] = forward_kwargs["pixel_values"]
-        if "image_grid_thw" in forward_kwargs:
-            output["image_grid_thw"] = forward_kwargs["image_grid_thw"]
-        if "pixel_attention_mask" in forward_kwargs:
-            output["pixel_attention_mask"] = forward_kwargs["pixel_attention_mask"]
-        if "image_sizes" in forward_kwargs:
-            output["image_sizes"] = forward_kwargs["image_sizes"]
-        if images is not None:
-            output["num_images"] = num_images
-        return output
 
     def _get_prompt_completion_embeddings(
         self,
@@ -317,6 +85,11 @@ class ContrastiveTrainer(GRPOTrainer):
 
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        print('attention_mask')
+        print(attention_mask)
+        print(attention_mask.shape)
+        print('attention_mask')
+
 
         model_inputs = {
             "input_ids": input_ids,
@@ -333,6 +106,12 @@ class ContrastiveTrainer(GRPOTrainer):
         outputs = model(**model_inputs)
         hidden_states = outputs.hidden_states[-1]
 
+        # ta có hidden_states 
+        # để lấu
+
+        # input_ids lấy maxlength (BS, SEQ_LENGTH) => LẤY ĐC TOKEN INPUT THEO SEQ_LENGTH 
+        # 
+
         prompt_lengths = prompt_mask.sum(dim=1)
         completion_lengths = completion_mask.sum(dim=1)
 
@@ -340,145 +119,80 @@ class ContrastiveTrainer(GRPOTrainer):
         prompt_end_indices = (prompt_lengths - 1).clamp(min=0)
         prompt_embeddings = hidden_states[batch_indices, prompt_end_indices]
 
-        completion_end_indices = prompt_lengths + completion_lengths - 1
-        # đoạn này có thể ko đúng tại promt_lenght tính = attention mask thì chỉ là length của prompt còn phần padding nữa, bên completion cũng có padding 
-        # nếu cộng lại thì có thể bị lệch index với prompt_indexs thì còn đúng chứ complsteion là saisai  
-        completion_end_indices = torch.where(completion_lengths > 0, completion_end_indices, prompt_end_indices)
+        # Fix: Tính toán completion end indices chính xác hơn
+        completion_end_indices = (prompt_lengths + completion_lengths - 1).clamp(
+            min=prompt_end_indices, max=input_ids.size(1) - 1
+        )
         completion_embeddings = hidden_states[batch_indices, completion_end_indices]
 
         return prompt_embeddings, completion_embeddings
 
+    def _generate_and_score_completions(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        # Call the parent implementation to get the base result
+        result = super()._generate_and_score_completions(inputs)
+        
+        # Extract the needed information for our custom logic
+        prompt_ids = result["prompt_ids"]
+        completion_ids = result["completion_ids"] 
+        prompt_mask = result["prompt_mask"]
+        completion_mask = result["completion_mask"]
+
+        # Add debug prints if needed
+        print(f'DEBUG: prompt_ids.shape: {prompt_ids.shape}')
+        print(f'DEBUG: completion_ids.shape: {completion_ids.shape}')
+        print(f'DEBUG: num_generations: {self.num_generations}')
+        
+        # Add group_ids to track which samples belong to the same prompt (before shuffle)
+        batch_size = prompt_ids.size(0)
+        group_size = self.num_generations
+        
+        if batch_size % group_size == 0:
+            # Create group IDs: [0,0,1,1,2,2,...] for num_generations=2
+            group_ids = torch.arange(batch_size // group_size, device=prompt_ids.device)
+            group_ids = group_ids.repeat_interleave(group_size)
+            result["group_ids"] = group_ids
+            print(f'DEBUG: Added group_ids: {group_ids}')
+        else:
+            logger.warning(f"Batch size {batch_size} not divisible by num_generations {group_size}")
+            result["group_ids"] = None
+        
+        # Return the result from the parent class with added group_ids
+        return result
 
     def _compute_loss(self, model, inputs):
         print("DEBUG: Entering _compute_loss")
-        # Compute the per-token log probabilities for the model
+        
+        # Call the parent class loss computation
+        base_loss = super()._compute_loss(model, inputs)
+        
+        # If not using contrastive learning, return the original loss
+        if not self.use_contrastive:
+            return base_loss
+            
+        print('DEBUG: Entering contrastive block')
+        
+        # Check if we have group information (from before shuffle)
+        group_ids = inputs.get("group_ids")
+        print('group_ids:')
+        print(group_ids)
+        print('group_ids.shape:')
+        print(group_ids.shape)
+        if group_ids is None:
+            logger.warning("No group_ids found - skipping contrastive loss")
+            return base_loss
+        
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            num_images=inputs.get("num_images"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-        )
-
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
-        else:
-            entropy_mask = None
-
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-
         advantages = inputs["advantages"]
-        old_per_token_logps = inputs.get("old_per_token_logps")
-        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-
-        log_ratio = per_token_logps - old_per_token_logps
-        if self.importance_sampling_level == "token":
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level == "sequence":
-            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
-            )
-
-        coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-
-        if self.args.delta is not None:
-            coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        if entropy_mask is not None:
-            per_token_loss = per_token_loss * entropy_mask
-
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
-
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dapo":
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        mode = "train" if self.model.training else "eval"
-
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
-
-        def masked_batch_mean(x: torch.Tensor) -> torch.Tensor:
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                return x.mean()
-            else:
-                return (x * completion_mask).sum() / completion_token_count
-
-        if self.beta != 0.0:
-            mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
-
-        mean_entropy = masked_batch_mean(entropies)
-        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-
-        low_clip = masked_batch_mean(is_low_clipped.float())
-        high_clip = masked_batch_mean(is_high_clipped.float())
-        clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-        gathered_low_clip = self.accelerator.gather(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-
-        contrastive_loss = torch.tensor(0.0, device=loss.device)
-        if self.use_contrastive:
-            print('DEBUG: Entering contrastive block')
-            print('start prompt_ids:')
-            print(prompt_ids.shape)
-            print(prompt_ids)
-            print('end prompt_ids:')
-
-            print('start completion ids:')
-            print(completion_ids.shape)
-            print(completion_ids)
-            print('end completion ids:')
-
-            print("DEBUG: Starting contrastive embedding computation")
+        
+        print("DEBUG: Starting contrastive embedding computation")
+        print(f"DEBUG: group_ids after shuffle: {group_ids}")
+        print(f"DEBUG: advantages after shuffle: {advantages}")
+        
+        try:
+            # Compute embeddings for contrastive learning
             prompt_embeds, completion_embeds = self._get_prompt_completion_embeddings(
                 model,
                 prompt_ids,
@@ -492,54 +206,117 @@ class ContrastiveTrainer(GRPOTrainer):
                     "image_sizes": inputs.get("image_sizes"),
                 },
             )
-
-            group_size = self.num_generations
-            batch_size = prompt_ids.size(0)
-            if batch_size % group_size != 0:
-                logger.warning(
-                    f"Contrastive loss skipped: batch size {batch_size} not divisible by num_generations {group_size}"
-                )
-            else:
-                num_groups = batch_size // group_size
-                total = torch.tensor(0.0, device=loss.device)
-                valid_groups = 0
-
-                for group_idx in range(num_groups):
-                    start = group_idx * group_size
-                    end = start + group_size
-
-                    group_advantages = advantages[start:end]
-                    weights = torch.softmax(group_advantages, dim=0)
-
-                    pos_mask = group_advantages > 0
-                    if not pos_mask.any():
-                        best_idx = torch.argmax(group_advantages)
-                        pos_mask = torch.zeros_like(group_advantages, dtype=torch.bool)
-                        pos_mask[best_idx] = True
-
-                    anchor = prompt_embeds[start]
-                    group_completion_embeds = completion_embeds[start:end]
-
-                    sims = torch.matmul(group_completion_embeds, anchor) / self.contrastive_temperature
-                    log_probs = torch.log_softmax(sims, dim=0)
-
-                    pos_weights = weights[pos_mask]
-                    pos_weight_sum = pos_weights.sum()
-                    if pos_weight_sum <= 0:
-                        pos_weights = torch.full_like(pos_weights, 1.0 / pos_weights.size(0))
-                    else:
-                        pos_weights = pos_weights / pos_weight_sum
-
-                    group_loss = -(pos_weights * log_probs[pos_mask]).sum()
-                    total = total + group_loss
-                    valid_groups += 1
-
-                if valid_groups > 0:
-                    contrastive_loss = total / valid_groups
-                    print(f"DEBUG: Contrastive loss computed: {contrastive_loss.item()}")
-                    contrastive_loss = contrastive_loss / self.current_gradient_accumulation_steps
-                    self._metrics[mode]["contrastive_loss"].append(contrastive_loss.item())
-
-        total_loss = loss + self.contrastive_weight * contrastive_loss if self.use_contrastive else loss
-        return total_loss
+            
+            # Compute contrastive loss using group_ids to handle shuffle
+            contrastive_loss = self._compute_contrastive_loss_with_groups(
+                prompt_embeds, completion_embeds, advantages, group_ids
+            )
+            
+            print(f"DEBUG: Base loss: {base_loss.item():.4f}, Contrastive loss: {contrastive_loss.item():.4f}")
+            
+            # Combine losses
+            total_loss = base_loss + self.contrastive_weight * contrastive_loss
+            
+            # Log metrics
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["contrastive_loss"].append(contrastive_loss.item())
+            self._metrics[mode]["total_loss"].append(total_loss.item())
+            
+            return total_loss
+            
+        except Exception as e:
+            logger.warning(f"Contrastive loss computation failed: {e}")
+            return base_loss
     
+    def _compute_contrastive_loss_with_groups(
+        self, 
+        prompt_embeds: torch.Tensor,
+        completion_embeds: torch.Tensor,
+        advantages: torch.Tensor,
+        group_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute contrastive loss between good and bad completions for each prompt group.
+        This version handles shuffled data by using group_ids to reconstruct groups.
+        
+        Args:
+            prompt_embeds: [batch_size, hidden_dim] - embeddings for prompts
+            completion_embeds: [batch_size, hidden_dim] - embeddings for completions
+            advantages: [batch_size] - advantages for each completion
+            group_ids: [batch_size] - group ID for each sample (same ID = same prompt)
+            
+        Returns:
+            contrastive_loss: scalar loss value
+        """
+        device = prompt_embeds.device
+        unique_groups = torch.unique(group_ids)
+        total_loss = torch.tensor(0.0, device=device)
+        valid_groups = 0
+        
+        for group_id in unique_groups:
+            # Find all samples belonging to this group
+            group_mask = (group_ids == group_id)
+            group_indices = torch.where(group_mask)[0]
+            
+            if len(group_indices) < 2:
+                continue  # Need at least 2 samples for contrastive learning
+            
+            # Get group data
+            group_advantages = advantages[group_indices]
+            group_completion_embeds = completion_embeds[group_indices]
+            # Use the first prompt embedding as anchor (all should be same for same group)
+            anchor_prompt_embed = prompt_embeds[group_indices[0]]
+            
+            # Skip if all advantages are the same (no contrast)
+            if torch.allclose(group_advantages, group_advantages[0]):
+                continue
+                
+            # Create positive and negative masks based on advantages
+            pos_mask = group_advantages > group_advantages.mean()
+            neg_mask = ~pos_mask
+            
+            # Skip if we don't have both positive and negative samples
+            if not pos_mask.any() or not neg_mask.any():
+                # Fallback: use best vs worst
+                best_idx = torch.argmax(group_advantages)
+                worst_idx = torch.argmin(group_advantages)
+                if best_idx == worst_idx:
+                    continue
+                pos_mask = torch.zeros_like(group_advantages, dtype=torch.bool)
+                neg_mask = torch.zeros_like(group_advantages, dtype=torch.bool)
+                pos_mask[best_idx] = True
+                neg_mask[worst_idx] = True
+            
+            # Compute similarities between prompt and completions
+            similarities = torch.matmul(group_completion_embeds, anchor_prompt_embed) / self.contrastive_temperature
+            
+            # Compute contrastive loss using InfoNCE-style loss
+            pos_similarities = similarities[pos_mask]
+            neg_similarities = similarities[neg_mask]
+            
+            # For each positive sample, compute loss against all negative samples
+            pos_loss = 0.0
+            pos_count = 0
+            
+            for pos_sim in pos_similarities:
+                # Create logits: [pos_sim, neg_sim1, neg_sim2, ...]
+                logits = torch.cat([pos_sim.unsqueeze(0), neg_similarities])
+                # Target is 0 (first element is positive)
+                target = torch.zeros(1, dtype=torch.long, device=device)
+                loss = torch.nn.functional.cross_entropy(logits.unsqueeze(0), target)
+                pos_loss += loss
+                pos_count += 1
+            
+            if pos_count > 0:
+                group_loss = pos_loss / pos_count
+                total_loss += group_loss
+                valid_groups += 1
+                
+                print(f"DEBUG: Group {group_id.item()}: {len(group_indices)} samples, "
+                      f"pos: {pos_mask.sum().item()}, neg: {neg_mask.sum().item()}, "
+                      f"loss: {group_loss.item():.4f}")
+        
+        if valid_groups > 0:
+            return total_loss / valid_groups
+        else:
+            return torch.tensor(0.0, device=device)

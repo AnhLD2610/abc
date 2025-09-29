@@ -347,3 +347,19 @@ class GRPOScriptArguments(ScriptArguments):
         default=0.07,
         metadata={"help": "Temperature for contrastive learning similarity computation."},
     )
+    use_contrastive: bool = field(
+        default=False,
+        metadata={"help": "Whether to use contrastive learning features."},
+    )
+    length_reward_weight: float = field(
+        default=0.3,
+        metadata={"help": "Weight for length component in composite rewards."},
+    )
+    accuracy_reward_weight: float = field(
+        default=0.7,
+        metadata={"help": "Weight for accuracy component in composite rewards."},
+    )
+    high_entropy_temperature: float = field(
+        default=1.5,
+        metadata={"help": "Temperature for high entropy exploration."},
+    )
